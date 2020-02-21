@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -20,6 +22,7 @@ type Menu struct {
 
 // collected product data struct
 type Product struct {
+	Id      int    // id of the product
 	Title   string // title of the product
 	ImgPath string // img path of the title
 }
@@ -30,12 +33,17 @@ type Status struct {
 	Status  int // status of the menu 0 == default active, 1 == collected , 2 == not active
 }
 
+type ElData struct {
+	Id    int    `json:"id"`
+	Title string `json:"title"`
+}
+
 // create mysql connection
 func dbConnect() (db *sql.DB) {
 
 	dbDriver := "mysql"         // database name
 	dbUser := "root"            // user name
-	dbPass := "1996"            // password
+	dbPass := "1234"            // password
 	dbName := "data_collection" // schema name
 
 	// connection to db
@@ -89,7 +97,6 @@ func selectMenu() []Menu {
 	}
 	defer db.Close() // close db
 	return res       // return res array data
-
 }
 
 // update menu table status
@@ -99,18 +106,20 @@ func updateMenu(status []Status) bool {
 	db := dbConnect()                                        // connect to db
 	updateSql := "UPDATE tb_menu SET tb_menu.status =( case" // set query statement
 	condition := " WHERE tb_menu.menu_id IN ("
-	menuList := []interface{}{} //set empty interface array
+	caseList := []interface{}{}  //interface array for case clouse
+	whereList := []interface{}{} // interface array for where clouse
 	fmt.Println("list of menuLists ", len(status))
 	//counter := 0
 	for _, row := range status {
 		//fmt.Println("menuData should be update ", row.Menu_id, "/", row.Status)
-		menuList = append(menuList, row.Menu_id, row.Status, row.Menu_id)
-		fmt.Println(menuList)
+		caseList = append(caseList, row.Menu_id, row.Status)
+		whereList = append(whereList, row.Menu_id)
+		fmt.Println(caseList)
 		updateSql += (" WHEN tb_menu.menu_id = ? THEN ? ")
 		condition += "?,"
 
 	}
-	fmt.Println("list should be passed to db ", menuList)
+	fmt.Println("list should be passed to db ", caseList)
 	updateSql += "end)"
 	condition = strings.TrimSuffix(condition, ",") // remove last "," from query statement
 	condition += ") "
@@ -124,7 +133,7 @@ func updateMenu(status []Status) bool {
 		defer db.Close()
 		return res
 	}
-	set, err := update.Exec(menuList...) // query data to db
+	set, err := update.Exec(append(caseList, whereList...)...) // query data to db
 	if err != nil {
 		fmt.Println("error occured while updating menu list ", err)
 		res = false
@@ -143,7 +152,7 @@ func insertProducts(products []Product, total int) bool {
 	res = false
 	db := dbConnect()
 	// insert sql statement
-	insertSql := "INSERT INTO tb_product(title, img_path, date) VALUES"
+	insertSql := "INSERT INTO tb_product(title, img_url, date) VALUES"
 	prods := []interface{}{}
 	fmt.Println("list of products ", len(products))
 	counter := 0
@@ -154,24 +163,96 @@ func insertProducts(products []Product, total int) bool {
 	}
 	fmt.Println("all data ", prods)
 	fmt.Println("sql statement ", insertSql)
-	// insertSql = strings.TrimSuffix(insertSql, ",")
-	// insert, err := db.Prepare(insertSql)
-	// if err != nil {
-	// 	fmt.Println(" error occured on Preparedb function ", err)
-	// 	res = false
-	// 	defer db.Close()
-	// 	return res
-	// }
-	// set, err := insert.Exec(prods...)
-	// if err != nil {
-	// 	fmt.Println("error in Exec function ", err)
-	// 	res = false
-	// 	defer db.Close()
-	// 	return res
-	// }
-	//fmt.Println("for loop worked ", counter)
-	//fmt.Println("data inserted to be result ", set)
+	insertSql = strings.TrimSuffix(insertSql, ",")
+	insert, err := db.Prepare(insertSql)
+	if err != nil {
+		fmt.Println(" error occured on Preparedb function ", err)
+		res = false
+		defer db.Close()
+		return res
+	}
+	set, err := insert.Exec(prods...)
+	if err != nil {
+		fmt.Println("error in Exec function ", err)
+		res = false
+		defer db.Close()
+		return res
+	}
+	fmt.Println("for loop worked ", counter)
+	fmt.Println("data inserted to be result ", set)
 	defer db.Close()
+	res = true
+	return res
+}
+
+func selectProducts() bool {
+	state := false
+	list := Product{}                                                                 // make list variable
+	res := []Product{}                                                                // set response value
+	db := dbConnect()                                                                 // connect to db
+	menuDB, err := db.Query("SELECT tb_product.id, tb_product.title FROM tb_product") // make a query to db
+	if err != nil {
+		//panic(err.Error())
+		fmt.Println("error making query to database ", err)
+		defer db.Close() // close database
+		return state     // return response
+	}
+	var id int
+	var title string
+
+	// loop db result
+	for menuDB.Next() {
+
+		// check each value
+		err = menuDB.Scan(&id, &title)
+		if err != nil {
+			//panic(err.Error())
+			fmt.Println("error occured while checking reading data from database ", err)
+			defer db.Close()
+
+			return state
+		}
+		// set db result data
+		list.Id = id       // set for  id
+		list.Title = title // set for title
+
+		// push data to res array
+		res = append(res, list)
+	}
+	state = true
+	defer db.Close() // close db
+	SaveProdsToElasticsearch(res)
+	return state
+}
+
+func SaveProdsToElasticsearch(products []Product) bool {
+
+	res := false
+	url := "http://localhost:9200/test1/_doc?pretty"
+	fmt.Println("URL>> ", url)
+
+	for _, row := range products {
+
+		body := &ElData{
+			Id:    row.Id,
+			Title: row.Title}
+
+		buf := new(bytes.Buffer)
+		json.NewEncoder(buf).Encode(body)
+		req, err := http.NewRequest("POST", url, buf)
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+
+			return res
+		}
+		defer resp.Body.Close()
+
+		fmt.Println("response Status:", resp.Status)
+
+	}
 	res = true
 	return res
 }
@@ -191,7 +272,7 @@ func parseHtml(url string) ([]Product, int) {
 		return res, counter
 
 	}
-	request.Header.Set("User-Agent", "Not Firefox") // set as default user-agent header
+
 	response, err := client.Do(request)
 	if err != nil {
 		//	panic(err.Error())
@@ -212,12 +293,12 @@ func parseHtml(url string) ([]Product, int) {
 
 	// analayze html as default from search-result id
 	doc.Find("#search-results").Find(".s-item-container").Each(func(i int, s *goquery.Selection) {
-		fmt.Println("you are here", i, s)
+
 		title := s.Find("h2").Text()
 		img_path, exists := s.Find(".a-fixed-left-grid-col.a-col-left").Find("img").Attr("src")
 		fmt.Println("set path", img_path, "/", title)
 		if exists {
-			fmt.Println("title: ", title, "img path ", img_path)
+			fmt.Println("title: ", title, "\nimg path ", img_path)
 			output.Title = title
 			output.ImgPath = img_path
 			fmt.Println(output.Title)
@@ -230,8 +311,8 @@ func parseHtml(url string) ([]Product, int) {
 		// check if upper code did not work use below code
 		fmt.Println("category changed design", counter)
 		doc.Find(".sg-col-inner").Find(".s-include-content-margin.s-border-bottom").Each(func(i int, s *goquery.Selection) {
-			fmt.Println("you are here", i, s)
-			title := s.Find(".a-size-mini.a-spacing-none.a-color-base s-line-clamp-2").Text()
+
+			title := s.Find("h2").Find(".a-size-medium.a-color-base.a-text-normal").Text()
 			img_path, exists := s.Find(".s-image").Attr("src")
 			fmt.Println("set path", img_path, "/", title)
 			if exists {
@@ -305,4 +386,7 @@ func main() {
 
 	result := htppUrlConnect() // result is bool variable value is true if data collected false if data is not collected
 	fmt.Println("data collected ", result)
+	if result {
+		selectProducts()
+	}
 }
